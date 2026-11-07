@@ -662,6 +662,39 @@
 
 /* Setup banner inside scan modal */
 #scanSetupBanner { margin-bottom: 0.8rem; }
+/* The key field lives INSIDE the setup banner, so the fix for "this will
+   not read my handwriting" appears in the same sentence as the problem —
+   not behind a settings screen the shopkeeper would have to go looking
+   for. */
+.scan-key {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.55rem;
+}
+.scan-key-form {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.scan-key-input {
+  flex: 1 1 14rem;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+}
+.scan-key-saved {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.scan-key-hint {
+  margin: 0;
+  line-height: 1.45;
+}
 
 /* =========================================================
    Reviewing a bill that came back with more than one line

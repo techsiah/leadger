@@ -219,7 +219,7 @@ Checked and confirmed absent:
 | `.env` | gitignored; only `.env.example` is tracked |
 | Admin SDK credentials | `GOOGLE_APPLICATION_CREDENTIALS` at runtime, or the Firebase CLI token |
 | Firebase web config | present in `js/firebase.js` — public by design, see above |
-| Gemini API key | placeholder `YOUR_GEMINI_API_KEY_HERE` in `js/ai-config.js` |
+| Gemini API key | placeholder `YOUR_GEMINI_API_KEY_HERE` in `js/ai-config.js`; a real key is pasted into the app and lives only in that device's `localStorage` (`trustx.geminiKey`) — never committed, never deployed |
 
 `tools/bootstrap-access.mjs` and `tools/cleanup-firestore.mjs` read either
 `GOOGLE_APPLICATION_CREDENTIALS` or the Firebase CLI token from

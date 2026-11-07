@@ -276,14 +276,19 @@ There is **no build step and no `.env` in the browser.** Configuration is a lite
 | What | Where | Notes |
 |---|---|---|
 | `FIREBASE_CONFIG` | `js/firebase.js:34` | The real web config. Public by design — see below. |
-| `geminiApiKey` | `js/ai-config.js:33` | Shipped as the placeholder `YOUR_GEMINI_API_KEY_HERE`. |
-| `maxImageSizeMb` | `js/ai-config.js:39` | `3.5` |
-| `downscaleLongEdge` / `jpegQuality` | `js/ai-config.js:40-41` | `1400` px / `0.82` — the AI copy |
-| `storeLongEdge` / `storeJpegQuality` | `js/ai-config.js:47-48` | `1000` px / `0.72` — the copy stored with the sale |
+| `geminiApiKey` | `js/ai-config.js:60` | Shipped as the placeholder `YOUR_GEMINI_API_KEY_HERE`. Optional. |
+| `geminiModel` / `geminiModelFallbacks` | `js/ai-config.js:61-62` | `gemini-3.5-flash-lite`, then `gemini-3.5-flash` — tried in order |
+| `maxImageSizeMb` | `js/ai-config.js:67` | `3.5` |
+| `downscaleLongEdge` / `jpegQuality` | `js/ai-config.js:68` | `1400` px / `0.82` — the AI copy |
+| `storeLongEdge` / `storeJpegQuality` | `js/ai-config.js:75` | `1000` px / `0.72` — the copy stored with the sale |
+| device key | `localStorage` `trustx.geminiKey` | Pasted once in the scan window; never in the repo |
 
-`isGeminiConfigured()` (`:53`) rejects any key shorter than 10 characters or containing `YOUR_`,
-`XXXXXXXX` or `xxxx`, so the committed placeholder can never be mistaken for a working key. While
-it is a placeholder the app runs **fully offline OCR** on Tesseract.js and says so.
+`isGeminiConfigured()` (`:160`) resolves the key with `resolveGeminiKey()` — the device's
+`localStorage` copy first, the file's second — and rejects anything shorter than 10 characters or
+containing `YOUR_`, `XXXXXXXX` or `xxxx`, so the committed placeholder can never be mistaken for a
+working key. With no key anywhere the app runs **fully offline OCR** on Tesseract.js and says so;
+offline OCR reads printed bills only, and a handwritten note that misses gets a plain-English
+message that opens the key field rather than a blame of the photograph.
 
 Tool scripts, which *do* run in Node, take real environment variables:
 

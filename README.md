@@ -290,15 +290,18 @@ Below the grid, a **catch-up panel** lists the days still to fill in (up to 8), 
 
 <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd>, or `Have a paper bill? Scan it instead` inside the Record-a-sale dialog.
 
+Drop, paste or pick a photo and **the reading starts by itself** — there is no *Analyze* press between the photo and the answer. The button stays on screen as a *re-read* for a photo that came out badly. What comes back is a review list you check and then save; nothing is written until you say so.
+
 ```mermaid
 flowchart TD
     A["Receipt photo<br/>file · paste · drag · drop"] --> B{"HEIC or HEIF?"}
     B -- yes --> B1["heic2any convert"] --> C["Downscale to 1400px at q0.82"]
     B -- no --> C
-    C --> D{"Gemini key configured?"}
-    D -- yes --> E["POST generativelanguage.googleapis.com<br/>gemini-1.5-flash · temperature 0.2<br/>responseMimeType application/json"]
-    D -- "no - placeholder in this repo" --> F["Tesseract.js 5.1.1<br/>fully offline · nothing leaves the device"]
-    E -- "429 · 400 · network" --> F
+    C --> D{"Gemini key configured?<br/>device-pasted or in ai-config.js"}
+    D -- yes --> E["POST generativelanguage.googleapis.com<br/>gemini-3.5-flash-lite · temperature 0.2<br/>responseMimeType application/json"]
+    D -- "no key anywhere" --> F["Tesseract.js 5.1.1<br/>fully offline · nothing leaves the device<br/>printed bills only — never handwriting"]
+    E -- "404 · 429 · 503<br/>next model in geminiModelFallbacks" --> E
+    E -- "400 · 401 · network · parse" --> F
     E --> G["Strict JSON out<br/>items[] · one entry per line sold"]
     F --> G
     G --> H["normalizeAiOutput + receipt-items<br/>clamp money · floor qty · derive rate"]
@@ -325,7 +328,7 @@ flowchart TD
 > service and a rate, and if a write fails half way, the lines that landed are gone from the list
 > and the ones that did not are still on it.
 
-> **Right now the Gemini key in `js/ai-config.js` is the literal placeholder `YOUR_GEMINI_API_KEY_HERE`, so the shipped app runs the offline Tesseract path.** The Gemini branch is real code and is documented here because it exists — not because it is switched on. See [Integrations](#integrations).
+> **No key anywhere = the offline Tesseract path, which reads printed bills and cannot read handwriting.** The key can come from the scan window's *Add free Gemini key* field (kept in that device's `localStorage` as `trustx.geminiKey`, never committed) or from `geminiApiKey` in `js/ai-config.js`. `isGeminiConfigured()` rejects anything shorter than 10 characters or containing a `YOUR_` / `XXXXXXXX` / `xxxx` placeholder token, so the shipped placeholder can never be mistaken for a working key. When offline OCR fails on a handwritten note it says so in plain words and opens the key field beside the message. See [Integrations](#integrations).
 
 ### Keyboard map
 
@@ -868,7 +871,7 @@ flowchart TD
     end
 
     subgraph EXT["External services"]
-        GEM["Google Gemini API<br/>generativelanguage v1beta<br/>gemini-1.5-flash<br/>key is a placeholder today"]
+        GEM["Google Gemini API<br/>generativelanguage v1beta<br/>gemini-3.5-flash-lite (+fallbacks)<br/>key: device-pasted or ai-config.js"]
         TESS["Tesseract.js 5.1.1<br/>offline OCR fallback"]
         HEIC["heic2any<br/>iPhone HEIC to JPEG"]
         FONT["Google Fonts<br/>Nunito"]
@@ -1023,7 +1026,7 @@ The photo of a scanned receipt is stored as its own small document at `dayHeads/
 
 Drop, paste or pick a photo. HEIC/HEIF from an iPhone is converted first. The image is downscaled to a 1400 px long edge at quality 0.82 (hard cap ≈ 4.2 MB), then read by one of two engines:
 
-**Gemini path** — `gemini-1.5-flash` at `generativelanguage.googleapis.com/v1beta`, `temperature: 0.2`, `maxOutputTokens: 500`, `responseMimeType: "application/json"` with a full `responseSchema`. The system prompt is written for an Indian digital-service shop and demands strict JSON with Indian rupees, `null` rather than a guess for anything illegible, and no markdown fences.
+**Gemini path** — `gemini-3.5-flash-lite` (then `geminiModelFallbacks` in order) at `generativelanguage.googleapis.com/v1beta`, `temperature: 0.2`, `maxOutputTokens: 1024`, `responseMimeType: "application/json"` with a full `responseSchema` using `nullable: true` rather than JSON-Schema unions. The system prompt is written for an Indian digital-service shop, says outright that the paper may be handwritten, and demands strict JSON with Indian rupees, `null` rather than a guess for anything illegible, and no markdown fences.
 
 **Offline path** — Tesseract.js 5.1.1, which sends **nothing anywhere**. It extracts text and parses it with weighted heuristics: total candidates are scored `+5` near *total / grand / bill / payable / balance / net / amount*, `−1` near *sub / before / without / GST / VAT / tax / items*; quantity is read from `qty:` or `2 x`; the service name is matched against a ten-entry ordered keyword table before falling back to the best-scoring alphabetic line; the payment method is inferred from an ordered token list.
 
@@ -1574,7 +1577,7 @@ No TTL policy, no scheduled backup and no soft-delete are configured. A day head
 ### The Gemini request, precisely
 
 ```text
-POST https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=<API_KEY>
+POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=<API_KEY>
 Content-Type: application/json
 
 {
@@ -1585,12 +1588,19 @@ Content-Type: application/json
   ]}],
   "generationConfig": {
     "temperature": 0.2,
-    "maxOutputTokens": 500,
+    "maxOutputTokens": 1024,
     "responseMimeType": "application/json",
-    "responseSchema": { /* 8 properties, paymentMethod enum cash|upi|card|due|null */ }
+    "responseSchema": { /* 8 properties, paymentMethod enum cash|upi|card|due, nullable: true throughout */ }
   }
 }
 ```
+
+The model is **not** a single hard-coded name: `AI_CONFIG.geminiModel` is tried first and `AI_CONFIG.geminiModelFallbacks` after it, and a `404` (retired name), `429` (rate limit) or `503` (busy) moves down that list instead of failing the scan. This exists because `gemini-1.5-flash` — the original name here — was retired by Google on 2025-09-24, and every scan had quietly been falling back to offline OCR ever since.
+
+Two schema details are load-bearing:
+
+- `nullable: true`, **not** `type: ["number", "null"]`. The union form is JSON-Schema rather than the proto this endpoint speaks, and it answers `400 INVALID_ARGUMENT` (*"Proto field is not repeating, cannot start list"*) for every field that uses it — which is every money field.
+- `maxOutputTokens: 1024`, not the 500 it started at: three lines of JSON do not fit in 500 tokens, and a truncated response surfaces as *"could not parse AI response"*.
 
 Documented free-tier limits, as noted in `js/ai-config.js`: **1,500 requests/day · 15 RPM · 1M tokens/day**.
 
@@ -1598,13 +1608,22 @@ Documented free-tier limits, as noted in `js/ai-config.js`: **1,500 requests/day
 
 | Condition | Result |
 |---|---|
-| `400` matching `/API key\|API_KEY\|invalid/i` | *"Gemini API key looks invalid. Check js/ai-config.js."* |
-| `429` | *"Gemini free-tier rate limit hit — wait a moment or use offline OCR mode."* |
+| `400` matching `/API key\|API_KEY\|invalid/i` | *"Gemini API key looks invalid. Re-paste it in the scan window, or check js/ai-config.js."* |
+| `404` / `429` / `503` on one model | **next model in the list** — a retired or busy name is not a broken photograph |
+| Rate limit on the last model | *"Gemini free-tier rate limit on `<model>` — wait a moment and re-read."* |
 | Network failure | *"Network error talking to Gemini. Check your connection."* |
 | Unreadable / empty / unparseable body | salvage attempt, then a specific "try a clearer photo" message |
 | **Any** Gemini failure | toast, then **fall through to the offline OCR path** |
+| Offline OCR finds nothing, **and no key is set** | *"Offline OCR cannot read handwriting…"* — the key field opens in place, and re-reads the same photo once a key is saved |
 
-There is **no runtime UI for entering an API key** — the key is edited in `js/ai-config.js`, and `isGeminiConfigured()` detects the `YOUR_` / `XXXXXXXX` / `xxxx` placeholder tokens and switches the whole UI to `Offline OCR` labelling.
+### The key
+
+The key can come from **two places**, in this order:
+
+1. **Pasted into the app** — the scan window's setup banner has an *"Add free Gemini key"* field. It is kept in that device's `localStorage` under `trustx.geminiKey`, so it is never written into the repository, never travels with a deploy, and needs no file editing. This is the recommended path.
+2. **`js/ai-config.js`** — `geminiApiKey`, for an operator who wants the key baked into the build. Leave it as the placeholder unless you mean it: a key committed to a public repository is a key anybody can spend.
+
+`isGeminiConfigured()` resolves the device key first and the file's second, and rejects anything shorter than 10 characters or containing the `YOUR_` / `XXXXXXXX` / `xxxx` placeholder tokens — which is what switches the whole UI to `Offline OCR` labelling.
 
 ---
 
@@ -1729,22 +1748,26 @@ export const FIREBASE_CONFIG = {
 
 ```js
 export const AI_CONFIG = {
-  geminiApiKey:   "YOUR_GEMINI_API_KEY_HERE",
-  geminiModel:    "gemini-1.5-flash",
-  geminiEndpoint: "https://generativelanguage.googleapis.com/v1beta",
-  maxImageSizeMb: 3.5,
-  downscaleLongEdge: 1400,
-  jpegQuality:    0.82,
-  storeLongEdge:  1000,
-  storeJpegQuality: 0.72,
+  geminiApiKey:          "YOUR_GEMINI_API_KEY_HERE",
+  geminiModel:           "gemini-3.5-flash-lite",
+  geminiModelFallbacks:  ["gemini-3.5-flash"],
+  geminiEndpoint:        "https://generativelanguage.googleapis.com/v1beta",
+  maxImageSizeMb:        3.5,
+  downscaleLongEdge:     1400,
+  jpegQuality:           0.82,
+  storeLongEdge:         1000,
+  storeJpegQuality:      0.72,
 };
 ```
 
 | Value | Where to get it | Secret? |
 |---|---|---|
 | `geminiApiKey` | [aistudio.google.com](https://aistudio.google.com) → Get API key (no credit card) | ⚠️ **treat as sensitive** — it travels in the URL query string |
+| device key | the scan window's *"Add free Gemini key"* field → `localStorage.trustx.geminiKey` | ⚠️ device-local only; never committed, never deployed |
 
-**Leaving it as the placeholder is a supported configuration.** The app detects it and runs fully offline OCR instead.
+`geminiModel` is the first name tried; `geminiModelFallbacks` are tried in order when one answers `404`, `429` or `503`. Google retires model names without asking, so a list rather than a single name is what keeps a scan working after the next retirement.
+
+**Leaving `geminiApiKey` as the placeholder is a supported configuration.** The app detects it and runs fully offline OCR instead — which reads printed bills and cannot read handwriting.
 
 ### 3 · `.env` — CLI tooling only, optional
 

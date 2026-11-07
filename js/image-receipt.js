@@ -16,9 +16,19 @@
      1. openScanReceiptModal() — drag-and-drop / pick-file
      2. HEIC → JPEG via heic2any (CDN on demand) if needed
      3. Client-side downscale to ~1400px long edge, jpeg compress
-     4. Preview shown → user clicks "Analyze receipt"
-     5. If Gemini key present → POST base64 image to Gemini with schema
+     4. Preview shown → reading starts BY ITSELF. There is no "Analyze"
+        click to remember: the file is chosen and the extraction is
+        already running, because a button between the photo and the
+        answer is a step the shopkeeper did not ask for. The button is
+        still there as a re-read when a photo comes out badly.
+     5. If a Gemini key is present (device-pasted or in ai-config.js)
+        → POST base64 image to Gemini with schema, walking down the
+        model list when one is retired, rate-limited or busy
         Else → Tesseract OCR → heuristic parser → structured JSON
+        — printed text only. Tesseract cannot read handwriting, so a
+        handwritten note in offline mode says exactly that and offers
+        the key field, rather than reporting "could not read any text"
+        as if the photo were at fault.
      6. ONE line on the bill → match the catalog, pre-fill the sale form
         → the shopkeeper reviews and saves.
         SEVERAL lines on the bill → they are NOT collapsed into the
@@ -37,6 +47,11 @@
    ========================================================= */
 
 import { toast, setLoading, openModal, closeModal, confirm } from "./app.js";
+/* MAX_TOTAL_PAISE bounds what a reading may claim a bill came to. It was
+   referenced twice below and never imported, so every single scan died
+   with "MAX_TOTAL_PAISE is not defined" — in the normalising step, after
+   the OCR or the AI had already done its work, which is why the failure
+   looked like a photograph the app could not read. */
 import {
   todayKolkata,
   isValidDateKey,
@@ -48,6 +63,7 @@ import {
   sanitizeQuantity,
   computeTotalPaise,
   toPaise,
+  MAX_TOTAL_PAISE,
   RECEIPT_IMAGE_MAX_BYTES,
   isStorableReceiptImage,
 } from "./utils.js";
@@ -70,6 +86,10 @@ import {
   isGeminiConfigured,
   aiSetupNotice,
   noKeyModeLabel,
+  resolveGeminiKey,
+  saveGeminiKey,
+  clearGeminiKey,
+  hasDeviceGeminiKey,
 } from "./ai-config.js";
 
 /* ---------- Icons ---------- */
@@ -95,6 +115,13 @@ let currentDataUrl = null;
 let currentLedgerImage = null;
 let currentServices = [];
 let analyzing = false;
+/**
+ * Which read owns the screen. Bumped by every new request, so a photo
+ * dropped while the previous one is still being read can never have the
+ * previous answer written over it — the older read simply notices it has
+ * been superseded and lets go of the UI.
+ */
+let analyzeSeq = 0;
 /**
  * A bill that came back with more than one line on it, waiting to be
  * checked and booked as a batch. Null whenever the scan modal is not
@@ -271,9 +298,11 @@ function encodeReceiptForLedger(img) {
 }
 
 /* =========================================================
-   EXTRACT #1: Google Gemini 1.5 Flash + response schema
+   EXTRACT #1: Google Gemini + response schema
    ========================================================= */
 
+/* Kept above the code that sends it, so the instruction and the schema
+   can be read side by side: they have to agree about what a bill is. */
 const GEMINI_SYSTEM_PROMPT =
   `You are receipt-reading AI for a small Indian digital-service shop
 (TrustX Ledger, currency Indian Rupee ₹). Return STRICT JSON only.
@@ -297,6 +326,10 @@ Shape (every field required; use null if genuinely unreadable):
 }
 
 Rules:
+- The paper may be HANDWRITTEN, printed, or a mix of both. Read it as a
+  human would: a scrawled name is still the name, a figure with a
+  wobbly digit is still the figure. Do not refuse a page because the
+  writing is untidy, and do not "correct" what it says.
 - A bill is a LIST. Put EVERY line the customer was charged for into
   "items" — three sold lines means three entries, each with its own
   quantity, rate and amount. Do NOT merge them and do NOT keep only
@@ -313,10 +346,25 @@ Rules:
 - If a word really can't be read, use null, not a guess.
 - Never include markdown fences or prose — ONLY valid JSON.`;
 
-async function extractWithGemini(dataUrl, onProgress) {
-  if (onProgress) onProgress("Using Gemini AI — reading receipt…");
-  const apiKey = AI_CONFIG.geminiApiKey.trim();
-  const model = AI_CONFIG.geminiModel || "gemini-1.5-flash";
+/**
+ * Statuses that say "this MODEL, right now" rather than "this request is
+ * wrong". A retired model name 404s forever, a rate limit 429s for a
+ * minute, a model under load 503s for a minute. None of them say anything
+ * about the photograph, so the answer is the next model in the list —
+ * never an error toast the shopkeeper would read as "the scanner is
+ * broken". 400 and 401 are NOT here: those mean the key or the payload is
+ * wrong, and retrying against another name would fail the same way.
+ */
+function isModelUnavailable(status) {
+  return status === 404 || status === 429 || status === 503;
+}
+
+/**
+ * One attempt against one model name.
+ * Throws an error carrying `.retryable = true` when the model itself was
+ * the problem, which is what lets extractWithGemini() walk the list.
+ */
+async function callGeminiModel(model, apiKey, dataUrl, onProgress) {
   const endpoint =
     `${AI_CONFIG.geminiEndpoint}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
@@ -359,23 +407,32 @@ async function extractWithGemini(dataUrl, onProgress) {
               properties: {
                 serviceName: { type: "string" },
                 quantity: { type: "number" },
-                rateRupees: { type: ["number", "null"] },
-                totalRupees: { type: ["number", "null"] },
+                /* `nullable: true`, not a JSON-Schema union of number
+                   OR null. The union form is JSON-Schema, not the proto
+                   this API speaks: it answers 400 INVALID_ARGUMENT
+                   ("Proto field is not repeating, cannot start list")
+                   for every field that used it — which is every money
+                   field. With a real key in place that 400 looked
+                   exactly like a broken scanner, because the error fell
+                   through to offline OCR. */
+                rateRupees: { type: "number", nullable: true },
+                totalRupees: { type: "number", nullable: true },
               },
               required: ["serviceName", "quantity"],
             },
           },
           serviceName: { type: "string" },
-          totalRupees: { type: ["number", "null"] },
+          totalRupees: { type: "number", nullable: true },
           quantity: { type: "number" },
-          rateRupees: { type: ["number", "null"] },
-          customerName: { type: ["string", "null"] },
-          dateYYYYMMDD: { type: ["string", "null"] },
+          rateRupees: { type: "number", nullable: true },
+          customerName: { type: "string", nullable: true },
+          dateYYYYMMDD: { type: "string", nullable: true },
           paymentMethod: {
-            type: ["string", "null"],
-            enum: ["cash", "upi", "card", "due", null],
+            type: "string",
+            enum: ["cash", "upi", "card", "due"],
+            nullable: true,
           },
-          notes: { type: ["string", "null"] },
+          notes: { type: "string", nullable: true },
         },
         required: ["serviceName", "quantity", "items"],
       },
@@ -395,10 +452,18 @@ async function extractWithGemini(dataUrl, onProgress) {
   if (!resp.ok) {
     let txt = "";
     try { txt = await resp.text(); } catch (_) { /* noop */ }
-    if (resp.status === 400 && /API key|API_KEY|invalid/i.test(txt))
-      throw new Error("Gemini API key looks invalid. Check js/ai-config.js.");
-    if (resp.status === 429)
-      throw new Error("Gemini free-tier rate limit hit — wait a moment or use offline OCR mode.");
+    if (resp.status === 400 && /API key|API_KEY|invalid/i.test(txt)) {
+      throw new Error("Gemini API key looks invalid. Re-paste it in the scan window, or check js/ai-config.js.");
+    }
+    if (isModelUnavailable(resp.status)) {
+      const e = new Error(
+        resp.status === 429
+          ? `Gemini free-tier rate limit on ${model} — wait a moment and re-read.`
+          : `${model} is unavailable (${resp.status}).`
+      );
+      e.retryable = true;
+      throw e;
+    }
     throw new Error(`Gemini error (${resp.status}). ${txt ? txt.slice(0, 200) : ""}`);
   }
 
@@ -419,6 +484,46 @@ async function extractWithGemini(dataUrl, onProgress) {
   }
   return normalizeAiOutput(parsed);
 }
+
+/**
+ * Read the photo with Gemini, walking the configured model list.
+ *
+ * The list exists because a single hard-coded model name is a single
+ * point of failure that Google retires without asking: `gemini-1.5-flash`
+ * went away in Sept 2025 and every scan since silently fell back to
+ * offline OCR, which is why handwriting appeared to "not work" at all.
+ */
+async function extractWithGemini(dataUrl, onProgress) {
+  const apiKey = resolveGeminiKey();
+  if (!apiKey) throw new Error("No Gemini API key is set.");
+
+  const wanted = [
+    AI_CONFIG.geminiModel,
+    ...(Array.isArray(AI_CONFIG.geminiModelFallbacks) ? AI_CONFIG.geminiModelFallbacks : []),
+  ].filter((m) => typeof m === "string" && m.trim());
+  const seen = new Set();
+  const chain = wanted.filter((m) => (seen.has(m) ? false : (seen.add(m), true)));
+
+  let lastErr = null;
+  for (let i = 0; i < chain.length; i++) {
+    const model = chain[i];
+    try {
+      if (onProgress) {
+        onProgress(i === 0 ? "Reading the handwriting with Gemini AI…" : `Model busy — trying ${model}…`);
+      }
+      return await callGeminiModel(model, apiKey, dataUrl, onProgress);
+    } catch (err) {
+      lastErr = err;
+      /* Only "this model is unavailable" walks on. A bad key or a bad
+         payload would fail identically on the next name, so trying it
+         would just double the wait. */
+      if (!(err && err.retryable) || i === chain.length - 1) throw err;
+      console.warn("[trustx-ledger] Gemini model unavailable, trying next:", model, err.message);
+    }
+  }
+  throw lastErr || new Error("Gemini could not read this receipt.");
+}
+
 
 /* =========================================================
    EXTRACT #2: Tesseract.js client-side OCR + heuristics
@@ -761,19 +866,39 @@ function scanModalMarkup() {
   const notice = aiSetupNotice();
   return (
     '<div class="scan-modal-body">' +
-    (notice
-      ? '<div class="alert alert-info" id="scanSetupBanner">' + escapeHtml(notice) + '</div>'
-      : '<div class="alert alert-info" id="scanSetupBanner" style="display:none;"></div>') +
+    /* The banner is always in the DOM and only shown when it has
+       something to say, because it is also where the key field lives: a
+       scan that has just failed on handwriting opens it in place, rather
+       than sending the shopkeeper off to hunt for a setting. */
+    '<div class="alert alert-info' + (notice ? "" : " is-hidden") + '" id="scanSetupBanner">' +
+    '<span id="scanSetupNote">' + escapeHtml(notice || "") + '</span>' +
+    '<div class="scan-key" id="scanKeyRow">' +
+    '<button type="button" class="btn btn-ghost btn-sm is-hidden" id="scanKeyToggle">Add free Gemini key</button>' +
+    '<div class="scan-key-form is-hidden" id="scanKeyForm">' +
+    '<input class="input scan-key-input" id="scanKeyInput" type="password" ' +
+    'placeholder="Gemini API key" autocomplete="off" spellcheck="false" maxlength="300" ' +
+    'aria-label="Gemini API key" />' +
+    '<button type="button" class="btn btn-primary btn-sm" id="scanKeySave">Save</button>' +
+    '<button type="button" class="btn btn-ghost btn-sm" id="scanKeyCancel">Cancel</button>' +
+    '</div>' +
+    '<div class="scan-key-saved is-hidden" id="scanKeySavedRow">' +
+    '<span class="small">Gemini key saved on this device.</span>' +
+    '<button type="button" class="btn btn-ghost btn-sm" id="scanKeyClear">Remove</button>' +
+    '</div>' +
+    '<p class="small muted scan-key-hint" id="scanKeyHint">' +
+    'Free at aistudio.google.com — no credit card. Only the photo is sent; never your shop data, sales or customers.</p>' +
+    '</div>' +
+    '</div>' +
     '<div class="scan-stage" id="scanStage">' +
     /* ---- Stage 1: Drop zone ---- */
     '<div class="scan-dropzone" id="dropZone" role="button" tabindex="0" aria-label="Upload receipt photo">' +
     '<input type="file" id="fileInput" accept="image/*,.heic,.heif" capture="environment" class="is-hidden" />' +
     '<div class="scan-dropzone-inner">' +
     '<div class="scan-dropzone-icon">' + ICON_UPLOAD + '</div>' +
-    '<h3 class="scan-dropzone-title">Upload a receipt photo</h3>' +
+    '<h3 class="scan-dropzone-title">Upload a bill or handwritten note</h3>' +
     '<p class="scan-dropzone-sub">Drag &amp; drop here, or tap to choose a file.<br/>' +
-    '<span class="small muted">JPEG, PNG, HEIC (iPhone), WEBP — all supported.<br/>' +
-    'Mode: <strong>' + escapeHtml(noKeyModeLabel()) + '</strong></span></p>' +
+    '<span class="small muted">It reads itself the moment it lands — no button to press.<br/>' +
+    'JPEG, PNG, HEIC (iPhone), WEBP · Mode: <strong>' + escapeHtml(noKeyModeLabel()) + '</strong></span></p>' +
     '</div></div>' +
     /* ---- Stage 2: Preview + analyze (hidden until file) ---- */
     '<div class="scan-preview is-hidden" id="previewWrap">' +
@@ -860,7 +985,7 @@ function buildScanOverlay() {
     '<div class="modal-header-icon modal-header-icon-receipt" aria-hidden="true">' + ICON_CAMERA + '</div>' +
     '<div class="modal-header-text">' +
     '<h3 id="scanModalTitle">Scan receipt</h3>' +
-    '<p class="modal-header-sub">Upload a bill photo — AI fills the sale, you review it.</p>' +
+    '<p class="modal-header-sub">Drop a bill or a handwritten note — it reads itself, you review it.</p>' +
     '</div>' +
     '<button type="button" class="modal-close" data-close aria-label="Close">' + ICON_CLOSE + '</button>' +
     '</div>' +
@@ -922,6 +1047,54 @@ function wireScanModal(root) {
   });
 
   analyzeBtn.addEventListener("click", () => onAnalyze(root));
+
+  /* ---- The Gemini key, pasted into this device ---- */
+  const keyToggle = root.querySelector("#scanKeyToggle");
+  const keyForm = root.querySelector("#scanKeyForm");
+  const keyInput = root.querySelector("#scanKeyInput");
+  const keySave = root.querySelector("#scanKeySave");
+  const keyCancel = root.querySelector("#scanKeyCancel");
+  const keyClear = root.querySelector("#scanKeyClear");
+
+  if (keyToggle) {
+    keyToggle.addEventListener("click", () => paintKeyState(root, { forceForm: true }));
+  }
+  if (keyCancel) {
+    keyCancel.addEventListener("click", () => paintKeyState(root));
+  }
+  if (keySave) {
+    keySave.addEventListener("click", () => {
+      try {
+        saveGeminiKey(keyInput ? keyInput.value : "");
+      } catch (err) {
+        toast(err.message || String(err), "error", 5000);
+        if (keyInput) keyInput.focus();
+        return;
+      }
+      toast("Gemini key saved on this device — handwritten notes will now be read.", "success", 4500);
+      refreshScanLabels(root);
+      /* A photo that already failed for want of a key is still loaded,
+         so read it again now. That is the whole reason the field was
+         opened, and making the shopkeeper drop the photo twice would be
+         a strange way to reward them for pasting a key. */
+      if (currentDataUrl) onAnalyze(root);
+    });
+  }
+  if (keyInput) {
+    keyInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (keySave) keySave.click();
+      }
+    });
+  }
+  if (keyClear) {
+    keyClear.addEventListener("click", () => {
+      clearGeminiKey();
+      toast("Key removed from this device.", "info", 3000);
+      refreshScanLabels(root);
+    });
+  }
 
   /* ---- The review stage's own controls ---- */
   const reread = root.querySelector("#reviewRereadBtn");
@@ -1003,8 +1176,72 @@ function setAnalyzingText(root, title, sub) {
   if (s && sub !== undefined) s.textContent = sub;
 }
 
+/**
+ * Show the key banner, and inside it whichever control matches how the
+ * key stands right now:
+ *   · nothing set      → the offer, with "Add free Gemini key"
+ *   · a device key     → "saved on this device" with a Remove
+ *   · a key in ai-config.js → nothing at all; there is nothing to set up
+ *
+ * `forceForm: true` opens the input itself. That is used when a scan has
+ * just failed for want of a key, so the fix sits on screen beside the
+ * problem instead of somewhere the shopkeeper has to go looking.
+ */
+function paintKeyState(root, { forceForm = false } = {}) {
+  const banner = root.querySelector("#scanSetupBanner");
+  if (!banner) return;
+  const note = root.querySelector("#scanSetupNote");
+  const toggle = root.querySelector("#scanKeyToggle");
+  const form = root.querySelector("#scanKeyForm");
+  const savedRow = root.querySelector("#scanKeySavedRow");
+  const hint = root.querySelector("#scanKeyHint");
+  const input = root.querySelector("#scanKeyInput");
+
+  const notice = aiSetupNotice();
+  const onDevice = hasDeviceGeminiKey();
+
+  if (notice && !onDevice) {
+    banner.classList.remove("is-hidden");
+    if (note) note.textContent = notice;
+    if (toggle) toggle.classList.toggle("is-hidden", forceForm);
+    if (form) form.classList.toggle("is-hidden", !forceForm);
+    if (savedRow) savedRow.classList.add("is-hidden");
+    if (hint) hint.classList.remove("is-hidden");
+    if (forceForm && input) {
+      input.value = "";
+      input.focus();
+    }
+    return;
+  }
+
+  if (onDevice) {
+    banner.classList.remove("is-hidden");
+    if (note) note.textContent = "Reading handwriting with Gemini AI.";
+    if (toggle) toggle.classList.add("is-hidden");
+    if (form) form.classList.add("is-hidden");
+    if (savedRow) savedRow.classList.remove("is-hidden");
+    if (hint) hint.classList.add("is-hidden");
+    return;
+  }
+
+  banner.classList.add("is-hidden");
+}
+
+/** Re-derive every label that depends on which path is live. */
+function refreshScanLabels(root) {
+  const btnText = root.querySelector("#analyzeBtn span");
+  if (btnText) btnText.textContent = "Analyze with " + noKeyModeLabel();
+  const dzSub = root.querySelector(".scan-dropzone-sub strong");
+  if (dzSub) dzSub.textContent = noKeyModeLabel();
+  paintKeyState(root);
+}
+
 async function handleFileChosen(file) {
   if (!file) return;
+  /* A new photo supersedes whatever was being read, before any of the
+     work of preparing it: the answer to the old photo is now irrelevant
+     and must not land on the new one. */
+  analyzeSeq++;
   currentRawFile = file;
   /* A new photo replaces the bill being reviewed: the rows, their
      amounts and the date belong to the paper that was just dropped. */
@@ -1043,14 +1280,24 @@ async function handleFileChosen(file) {
     (prepared.width && prepared.height ? `${prepared.width}×${prepared.height} · ` : "") +
     `${kb >= 1024 ? (kb/1024).toFixed(1)+" MB" : kb+" KB"} · ${fileIsHeic(file) ? "converted from HEIC" : "ready"}`;
   setStage(root, "preview");
+
+  /* Read it immediately. The preview is not a screen to look at — it is
+     the acknowledgement that the file arrived, and it is on screen for
+     as long as the reading takes. There is no "Analyze" click to
+     remember: the whole point of dropping a photo is that the entries
+     come back on their own. onAnalyze() reports its own failures. */
+  onAnalyze(root);
 }
 
 /* ---------- Analyze (dispatch: Gemini or offline OCR) ---------- */
 
 async function onAnalyze(root) {
-  if (analyzing) return;
   if (!currentDataUrl) { toast("Upload an image first.", "error"); return; }
 
+  /* Claim the screen for this read. Every await below re-checks this
+     token: if a newer photo arrived while this one was being read, this
+     answer is stale and must not touch the review list or the form. */
+  const run = ++analyzeSeq;
   analyzing = true;
   const btn = root.querySelector("#analyzeBtn");
   setLoading(btn, true);
@@ -1074,6 +1321,10 @@ async function onAnalyze(root) {
       })(),
       fetchServices().catch(() => []),
     ]);
+    /* Superseded while working: a newer photo owns the screen now, so
+       this reading is dropped rather than displayed against the wrong
+       picture. The newer read clears its own flags. */
+    if (run !== analyzeSeq) return;
     currentServices = services;
     analyzing = false;
     setLoading(btn, false);
@@ -1162,10 +1413,29 @@ async function onAnalyze(root) {
       );
     }
   } catch (err) {
+    if (run !== analyzeSeq) return;
     analyzing = false;
     setLoading(btn, false);
     setStage(root, "preview");
     const msg = err && err.message ? err.message : "Could not read this receipt. Try a clearer photo.";
+
+    /* The one failure worth naming out loud. Offline OCR has no chance
+       against handwriting — Tesseract reads printed glyphs only — so
+       reporting it as "could not read any text" blames the photograph
+       for a limit of the engine. Say what actually happened and put the
+       key field on screen, because that is the fix. */
+    const handwritingMiss =
+      !isGeminiConfigured() && /could not read any text|could not read this receipt/i.test(msg);
+    if (handwritingMiss) {
+      paintKeyState(root, { forceForm: true });
+      toast(
+        "Offline OCR cannot read handwriting. Paste a FREE Gemini key above " +
+          "(aistudio.google.com, no credit card) and it will read this note.",
+        "error",
+        9000
+      );
+      return;
+    }
     toast(msg, "error", 5500);
   }
 }
@@ -1481,7 +1751,11 @@ function readReviewDate(root) {
 /** Say which day the whole bill will land on, as the sale form does. */
 function paintReviewDay(root) {
   if (!currentScan) return;
-  const today = todayKollata();
+  /* Was `todayKollata()`. A one-letter typo in a function this file does
+     not define, so every multi-line bill threw a ReferenceError the
+     moment its review opened — the bill was read correctly off the
+     paper and then never shown to anyone. */
+  const today = todayKolkata();
   const input = root.querySelector("#scanDate");
   if (input) {
     input.max = today;
@@ -1725,24 +1999,18 @@ export function openScanReceiptModal() {
 
   currentRawFile = null;
   currentDataUrl = null;
+  currentLedgerImage = null;
   analyzing = false;
+  /* Anything still being read belongs to the previous visit and must
+     not land on this one. */
+  analyzeSeq++;
   /* A review left over from the last bill must not be a review the
      shopkeeper can still press save on. */
   clearReview();
   setStage(scanOverlay, "dropzone");
-  const banner = scanOverlay.querySelector("#scanSetupBanner");
-  if (banner) {
-    const notice = aiSetupNotice();
-    if (notice) { banner.style.display = ""; banner.textContent = notice; }
-    else banner.style.display = "none";
-  }
-  const btnText = scanOverlay.querySelector("#analyzeBtn span");
-  if (btnText) btnText.textContent = "Analyze with " + noKeyModeLabel();
+  refreshScanLabels(scanOverlay);
   const fileInput = scanOverlay.querySelector("#fileInput");
   if (fileInput) fileInput.value = "";
-  // Refresh the dropzone mode label too
-  const dzSub = scanOverlay.querySelector(".scan-dropzone-sub strong");
-  if (dzSub) dzSub.textContent = noKeyModeLabel();
 
   openModal(scanOverlay);
 }

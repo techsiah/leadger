@@ -19,6 +19,15 @@
    The last test is a source guard on the prompt itself, because that
    instruction is the bug: pure functions cannot catch a prompt that
    asks the model to summarise a list away.
+
+   3. THE SCANNER WOULD NOT READ AT ALL, and every cause was silent.
+      The model name was retired by Google (404 on every call), the
+      response schema used a JSON-Schema union the proto endpoint
+      rejects (400 on every call), and both fell through to offline OCR,
+      which cannot read handwriting — so a handwritten note reported
+      "could not read any text" as if the photograph were at fault. The
+      guards at the bottom pin the schema form, the model list, the
+      auto-read-on-drop, and the key handling that fixes it.
    ========================================================= */
 
 import test from "node:test";
@@ -39,6 +48,17 @@ import {
 } from "../js/receipt-items.js";
 
 import { MAX_RATE_PAISE, MAX_TOTAL_PAISE, MAX_QUANTITY } from "../js/utils.js";
+
+import {
+  AI_CONFIG,
+  isGeminiConfigured,
+  resolveGeminiKey,
+  saveGeminiKey,
+  clearGeminiKey,
+  hasDeviceGeminiKey,
+  aiSetupNotice,
+  noKeyModeLabel,
+} from "../js/ai-config.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -299,5 +319,269 @@ test("the extraction prompt asks for the bill's lines, not one summary line", ()
     src,
     /openReview\(/,
     "a multi-line bill must go to the review, which is where the list is shown",
+  );
+});
+
+/* ---------------- Why it would not read at all ----------------
+   Every cause below was silent: the call failed, the code fell through
+   to offline OCR, and offline OCR cannot read handwriting — so the
+   shopkeeper was told the photograph was unreadable. */
+
+const scanSrc = () => fs.readFileSync(path.join(ROOT, "js", "image-receipt.js"), "utf8");
+
+/**
+ * The file with its prose removed — comments and string literals, which
+ * are where words like "Analyze receipt)" and "TWO PATHS (no OpenAI"
+ * live. Without this a scope check reads the documentation and reports
+ * every noun in it as an undefined function.
+ *
+ * Template literals are dropped whole rather than opened up: what they
+ * interpolate is real code, but the literals themselves are the long
+ * HTML strings this file is mostly made of, and opening them would mean
+ * writing a JavaScript parser here.
+ */
+function codeOnly(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1 ")
+    .replace(/`(?:[^`\\]|\\.)*`/g, "``")
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
+    /* Regex literals last: they are the remaining source of characters
+       that would otherwise read as code — `/\b(total|grand)\b/` offers
+       up `b(`, and `/(photocop|print(?:out|ed)?)/i` offers up `print(`.
+       Strings go first so that the `//` inside "https://…" is already
+       gone and cannot be mistaken for a comment or a regex. */
+    .replace(/(?:^|[(,=:!?:&|{;\]}])\s*\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])*\/[a-z]*/g, " ");
+}
+
+test("the schema speaks proto nullability, not a JSON-Schema union", () => {
+  const src = scanSrc();
+  assert.ok(
+    !/type:\s*\[\s*"/.test(src),
+    "a union type is JSON-Schema, not the proto this endpoint speaks. It answers " +
+      "400 INVALID_ARGUMENT for every money field, which fell through to offline OCR " +
+      "and so looked exactly like a scanner that could not read",
+  );
+  assert.match(
+    src,
+    /nullable:\s*true/,
+    "nullable is how this API spells \"or null\", and the prompt offers null for unreadable fields",
+  );
+});
+
+test("the scanner does not name a retired model, and has somewhere to fall back to", () => {
+  assert.notEqual(
+    AI_CONFIG.geminiModel,
+    "gemini-1.5-flash",
+    "gemini-1.5-flash was retired on 2025-09-24 — every call 404s and the scan " +
+      "silently drops to OCR, which is why handwriting appeared to not work at all",
+  );
+  assert.ok(
+    Array.isArray(AI_CONFIG.geminiModelFallbacks) &&
+      AI_CONFIG.geminiModelFallbacks.length > 0,
+    "one hard-coded model name is one point of failure that Google retires without asking",
+  );
+  assert.match(AI_CONFIG.geminiEndpoint, /^https:/, "the key travels over TLS");
+});
+
+test("a photo is read the moment it lands, with no Analyze press in between", () => {
+  const src = scanSrc();
+  const start = src.indexOf("async function handleFileChosen");
+  const end = src.indexOf("async function onAnalyze");
+  assert.ok(start > -1 && end > start, "handleFileChosen is where a chosen file arrives");
+  assert.match(
+    src.slice(start, end),
+    /onAnalyze\(root\)/,
+    "dropping a file has to start the reading itself — the button between the photo " +
+      "and the answer is a step nobody asked for",
+  );
+});
+
+test("a superseded reading lets go rather than landing on the new photo", () => {
+  const checks = scanSrc().match(/run !== analyzeSeq/g) || [];
+  assert.ok(
+    checks.length >= 2,
+    "both the answer and the failure have to check they still own the screen, or a " +
+      "slow read of the previous photo is written over the one the shopkeeper just dropped",
+  );
+});
+
+/* The ReferenceError that had the scanner dead on arrival: MAX_TOTAL_PAISE
+   was read twice in the normalising step and never imported, so every scan
+   — Gemini or offline, key or no key — threw at the last moment, after the
+   reading was already done, and the shopkeeper was told the photograph
+   could not be read. Unit tests cannot reach it (the function is not
+   exported), so it is checked here, against utils.js itself. */
+test("every utils constant the scanner uses is actually imported", () => {
+  const utilsSrc = fs.readFileSync(path.join(ROOT, "js", "utils.js"), "utf8");
+  const exported = [...utilsSrc.matchAll(/export\s+(?:const|let|function|class)\s+([A-Za-z_$][\w$]*)/g)]
+    .map((m) => m[1]);
+
+  /* Comments only, not strings: the import specifier itself is a string,
+     and stripping it would leave nothing for the match below to find. */
+  const src = scanSrc()
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1 ");
+  /* [^}]* rather than [\s\S]*: the import blocks are scanned in source
+     order, and a lazy match that may cross a closing brace would start at
+     the FIRST import in the file and run on to this one. */
+  const block = (src.match(/import\s*\{([^}]*)\}\s*from\s*"\.\/utils\.js"/) || [null, ""])[1];
+  const imported = new Set(block.split(",").map((s) => s.trim()).filter(Boolean));
+
+  const missing = exported.filter(
+    (name) => new RegExp(`\\b${name}\\b`).test(src) && !imported.has(name),
+  );
+  assert.deepEqual(
+    missing,
+    [],
+    "referenced in js/image-receipt.js but never imported — a ReferenceError thrown " +
+      "after the reading finished, which is indistinguishable from an unreadable photo",
+  );
+});
+
+test("an offline miss on handwriting says so, and opens the key field", () => {
+  const src = scanSrc();
+  assert.match(
+    src,
+    /Offline OCR cannot read handwriting/,
+    "Tesseract reads printed glyphs only; reporting \"could not read any text\" " +
+      "blames the photograph for a limit of the engine",
+  );
+  assert.match(
+    src,
+    /paintKeyState\(root,\s*\{\s*forceForm:\s*true\s*\}\)/,
+    "the fix has to appear beside the problem, not behind a setting to go looking for",
+  );
+});
+
+/* A scope check, because two real bugs hid here and neither is reachable
+   by running anything: `MAX_TOTAL_PAISE` was read but never imported, and
+   `todayKollata()` was a one-letter typo for `todayKolkata()`. Both threw
+   a ReferenceError in the middle of a scan — after the reading was done —
+   and both were reported to the shopkeeper as a photograph that could not
+   be read. */
+test("every function the scanner calls is one it actually has in scope", () => {
+  const src = codeOnly(scanSrc());
+
+  const declared = new Set();
+  for (const m of src.matchAll(/(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g)) {
+    declared.add(m[1]);
+  }
+  /* `const conv = …`, `const openPicker = () => …` — a name bound to a
+     value is as much in scope as a function declaration is. */
+  for (const m of src.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) {
+    declared.add(m[1]);
+  }
+  /* Parameters, which is where `onProgress`, `resolve` and `reject`
+     come from. Any parenthesised list straight before `=>` or `{`. */
+  for (const m of src.matchAll(/\(([^()]{0,600})\)\s*(?:=>|\{)/g)) {
+    for (const part of m[1].split(",")) {
+      const name = part
+        .trim()
+        .replace(/=[\s\S]*$/, "")
+        .replace(/^\.\.\./, "")
+        .trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(name)) declared.add(name);
+    }
+  }
+
+  const imported = new Set();
+  for (const m of src.matchAll(/import\s*\{([^}]*)\}\s*from/g)) {
+    for (const part of m[1].split(",")) {
+      const name = part.trim().split(/\s+as\s+/).pop().trim();
+      if (name) imported.add(name);
+    }
+  }
+
+  /* What the runtime itself provides, plus the browser globals Node does
+     not happen to have. Anything reached through a dot (`Math.round`)
+     never enters the scan, so only bare calls are judged. */
+  const runtime = new Set(Object.getOwnPropertyNames(globalThis));
+  for (const g of [
+    "Image", "HTMLElement", "Node", "Audio", "Worker", "DOMParser", "Range",
+    "getComputedStyle", "matchMedia", "requestAnimationFrame", "cancelAnimationFrame",
+    "alert", "prompt", "Intl", "Event", "CustomEvent", "MutationObserver",
+    "IntersectionObserver", "ResizeObserver", "AbortController", "TextDecoder",
+    "TextEncoder", "crypto", "structuredClone", "queueMicrotask", "localStorage",
+    "sessionStorage", "navigator", "location", "history", "document", "window",
+    "atob", "btoa", "FileReader", "File", "Blob", "FormData", "DataTransfer",
+  ]) {
+    runtime.add(g);
+  }
+
+  const keywords = new Set([
+    "if", "for", "while", "switch", "catch", "return", "typeof", "function",
+    "new", "await", "throw", "delete", "void", "in", "of", "else", "do", "try",
+    "yield", "case", "instanceof", "async",
+  ]);
+
+  const missing = new Set();
+  for (const m of src.matchAll(/(^|[^.\w$])([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const before = m[1];
+    const name = m[2];
+    if (keywords.has(name)) continue;
+    if (/\bnew\s*$/.test(before)) continue; // a constructor, not a call
+    if (declared.has(name) || imported.has(name) || runtime.has(name)) continue;
+    missing.add(name);
+  }
+
+  assert.deepEqual(
+    [...missing].sort(),
+    [],
+    "called in js/image-receipt.js but not in scope — a ReferenceError thrown mid-scan, " +
+      "which the shopkeeper can only read as a photo the app failed to understand",
+  );
+});
+
+/* ---------------- The key ---------------- */
+
+/** A localStorage this test owns. ai-config reads it lazily, so
+ *  installing it before the assertions is enough. */
+function installFakeStorage() {
+  const mem = new Map();
+  const shim = {
+    setItem(k, v) { mem.set(String(k), String(v)); },
+    getItem(k) { return mem.has(String(k)) ? mem.get(String(k)) : null; },
+    removeItem(k) { mem.delete(String(k)); },
+  };
+  try {
+    Object.defineProperty(globalThis, "localStorage", {
+      value: shim,
+      configurable: true,
+      writable: true,
+    });
+  } catch (_) {
+    return false;
+  }
+  return true;
+}
+
+test("a key pasted into the device is the key in force, and a placeholder never counts", () => {
+  let storageReady = installFakeStorage();
+  if (!storageReady && typeof localStorage !== "undefined") storageReady = true;
+
+  clearGeminiKey();
+  assert.equal(hasDeviceGeminiKey(), false);
+  assert.equal(isGeminiConfigured(), false, "the shipped file key is the placeholder");
+  assert.ok(aiSetupNotice(), "with no key the shop is told why, rather than left to guess");
+  assert.equal(noKeyModeLabel(), "Offline OCR");
+
+  assert.throws(() => saveGeminiKey("short"), /too short/);
+  assert.throws(() => saveGeminiKey("YOUR_GEMINI_API_KEY_HERE"), /placeholder/);
+  if (!storageReady) return;
+
+  saveGeminiKey("AIzaFakeKeyForATestThatIsLongEnough123");
+  assert.equal(hasDeviceGeminiKey(), true);
+  assert.equal(resolveGeminiKey(), "AIzaFakeKeyForATestThatIsLongEnough123");
+  assert.equal(isGeminiConfigured(), true);
+  assert.equal(noKeyModeLabel(), "Gemini AI");
+  assert.equal(aiSetupNotice(), null, "a configured scanner has nothing left to set up");
+
+  clearGeminiKey();
+  assert.equal(
+    isGeminiConfigured(),
+    false,
+    "removing the device key returns the shop to exactly where it started",
   );
 });
