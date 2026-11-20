@@ -143,7 +143,12 @@ export function txnActionButtons(t, { closed = false } = {}) {
       : "") +
     (isDuePending(t)
       ? '<button class="btn btn-success btn-sm" type="button" data-act="paid" data-id="' +
-        id + '" title="' + (t.status === "paid" ? "Clear this due" : "Mark this due as paid") +
+        id + '" title="' +
+        (closed
+          ? "Reopen this day to settle the due"
+          : t.status === "paid"
+            ? "Clear this due"
+            : "Mark this due as paid") +
         '"' + off + ">Mark paid</button>"
       : "") +
     '<button class="btn btn-secondary btn-sm" type="button" data-act="edit" data-id="' +
@@ -534,18 +539,23 @@ function paintMethod() {
 }
 
 /**
- * A non-due sale is settled by definition, so the status control is
- * locked for everything except a due sale.
+ * The status follows the method, and it is never hand-editable: a due sale
+ * stays unpaid until it is settled with `Mark paid`, which is the only path
+ * that asks how the money arrived and moves it out of the due bucket. A
+ * status flip alone would leave the amount counted as due forever — the
+ * sale would read "Paid" while the calendar and dashboard still owed it.
  */
 function syncStatusControl() {
   const statusSel = overlay.querySelector("#txnEditStatus");
   const hint = overlay.querySelector("#txnEditStatusHint");
   const isDue = editMethod === "due";
 
-  statusSel.disabled = !isDue;
+  statusSel.disabled = true;
   if (isDue) {
-    statusSel.value = editing && editing.status === "paid" ? "paid" : "pending";
-    hint.textContent = "A due sale can be marked paid or left unpaid.";
+    /* Pending even when a legacy row still says paid: it IS still owed,
+       and settling it is what changes that. */
+    statusSel.value = "pending";
+    hint.textContent = "Still due. Settle it with Mark paid so the app knows how it was paid.";
   } else {
     statusSel.value = "paid";
     hint.textContent = "This sale is settled by definition.";

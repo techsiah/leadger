@@ -1645,6 +1645,14 @@ export async function updateTransaction(txnId, dateKey, patch = {}) {
   if (!status) status = statusForMethod(method);
   // A non-due sale is always settled; only a due sale may sit pending.
   if (method !== "due") status = "paid";
+  /* A due sale leaves the due bucket only through markTransactionPaid(),
+     which records how the money arrived and moves the counters. Flipping
+     just the status here would leave the amount owed everywhere the heads
+     are read (the calendar, the dashboard), which is exactly the bug this
+     guard makes impossible to repeat. */
+  if (method === "due" && status === "paid") {
+    throw new Error("Settle a due with Mark paid so the app knows how the money arrived.");
+  }
 
   const amounts = splitAmounts(totalPaise, method);
   /* The day's counters move by the DIFFERENCE, so the row's previous
