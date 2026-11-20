@@ -1691,31 +1691,71 @@ export async function updateTransaction(txnId, dateKey, patch = {}) {
 }
 
 /**
- * Settle a due sale. Flips `status` to `paid` and refreshes the audit
- * fields; nothing else on the row is touched. Settling does not move any
- * money — it was always owed and always counted as due — so the day's
- * counters are deliberately left alone.
+ * Settle a due sale. The money arrived by one of the three collection
+ * methods, so the sale's `amounts` are re-split from the due bucket into
+ * `method`, `paymentMethod` flips to it and `status` becomes `paid`;
+ * the day's counters shift by the difference in the same batch. The
+ * gross is untouched — the sale was always booked for this amount —
+ * it is the bucket the money sat in that changes.
+ *
+ * A sale that is not waiting on a payment is refused rather than
+ * re-settled, and a row the old status-only settle left behind (due
+ * and already marked paid) is settled the same way, so it too can be
+ * cleared this way.
  */
-export async function markTransactionPaid(txnId, dateKey) {
+export async function markTransactionPaid(txnId, dateKey, method) {
   const id = String(txnId || "").trim();
   if (!id) throw new Error("That sale could not be found.");
   if (!isValidDateKey(dateKey)) throw new Error("That business day is not valid.");
+
+  if (!isPaymentMethod(method) || method === "due") {
+    throw new Error("Choose how the due was paid (cash, UPI or card).");
+  }
 
   const b = await bridge();
   const fs = b.firestore;
   const user = b.auth.currentUser;
   if (!user || !user.uid) throw new Error("You need to be signed in to settle a due sale.");
 
-  await guardQuota(() =>
-    fs.updateDoc(txnRef(fs, b.db, dateKey, id), {
-      status: "paid",
-      updatedAt: fs.serverTimestamp(),
-      updatedBy: user.uid,
-    })
-  );
-  noteWrites();
+  const ref = txnRef(fs, b.db, dateKey, id);
+  const before = await chargedGetDoc(fs, ref);
+  if (!before.exists()) throw new Error("That sale could not be found.");
+  const prev = before.data();
+  if (prev.paymentMethod !== "due") {
+    throw new Error("That sale is not waiting on a payment.");
+  }
+
+  const prevAmounts = amountsFromDoc(prev);
+  const totalPaise = toPaiseInt(prev.total);
+  const amounts = splitAmounts(totalPaise, method);
+
+  const now = fs.serverTimestamp();
+  const next = {
+    amounts,
+    paymentMethod: method,
+    status: "paid",
+    updatedAt: now,
+    updatedBy: user.uid,
+  };
+
+  const head = headRef(fs, b.db, dateKey);
+  const batch = fs.writeBatch(b.db);
+  batch.update(ref, next);
+  batch.update(head, {
+    "counters.txnCount": fs.increment(0),
+    "counters.grossPaise": fs.increment(0),
+    "counters.cashPaise": fs.increment(amounts.cash - prevAmounts.cash),
+    "counters.upiPaise": fs.increment(amounts.upi - prevAmounts.upi),
+    "counters.cardPaise": fs.increment(amounts.card - prevAmounts.card),
+    "counters.duePaise": fs.increment(amounts.due - prevAmounts.due),
+    "counters.collectedPaise": fs.increment(amounts.collected - prevAmounts.collected),
+    updatedAt: now,
+    updatedBy: user.uid,
+  });
+  await guardQuota(() => batch.commit());
+  noteWrites(2);
   invalidateDayReads(dateKey);
-  return { txnId: id, status: "paid" };
+  return { txnId: id, status: "paid", paymentMethod: method };
 }
 
 /**

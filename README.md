@@ -537,7 +537,7 @@ The dashboard reads the day head, which is why the counters must be provably cor
 
 - Day navigation: `◀ Previous day` · date input · `Next day` · `Today` — the date lives in the URL, so a day is linkable and survives a refresh
 - **Filters:** search (service or customer, debounced 250 ms) · payment method · status
-- **Row actions** per sale: `View receipt photo` *(when one exists)* · `Mark paid` *(only for a pending due)* · `Edit sale` · `Delete sale`
+- **Row actions** per sale: `View receipt photo` *(when one exists)* · `Mark paid` *(only for a sale still counting as due)* — asks how the customer paid (cash/UPI/card) and moves the money out of the due bucket · `Edit sale` · `Delete sale`
 - **Backfilled** badge beside the time of any row entered after its business day
 - **Day totals** rendered from the rows on screen, not from the stored counters
 - Cursor paging, 100 rows a page, `Load more`

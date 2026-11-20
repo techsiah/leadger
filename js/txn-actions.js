@@ -99,12 +99,22 @@ let services = null;   // catalog for the picker; null until the first read
 let editing = null;    // the row currently open in the dialog
 let editMethod = "cash";
 let saving = false;    // double-submit guard
+let settleOverlay = null;   // the settle dialog, likewise built on first use
+let settleMethod = "cash";  // how the customer paid the due
+let settleTarget = null;    // the row the settle dialog is open on
+let settling = false;       // double-submit guard
+/* Resolves the promise settleRow() handed back to the page: true when the
+   due was settled, false when the dialog was dismissed. The page re-renders
+   on true, which is what makes the owed amount disappear on screen. */
+let settleResolve = null;
 
 /* ---------------- Row markup ---------------- */
 
-/** A due sale that has not been settled is the only one with a third action. */
+/* A sale can be settled while it still counts as due, whether or not an
+   earlier build already flipped its status to paid — those rows never
+   left the due bucket, so they need the same way out. */
 function isDuePending(t) {
-  return t && t.paymentMethod === "due" && t.status === "pending";
+  return t && t.paymentMethod === "due";
 }
 
 /**
@@ -133,7 +143,8 @@ export function txnActionButtons(t, { closed = false } = {}) {
       : "") +
     (isDuePending(t)
       ? '<button class="btn btn-success btn-sm" type="button" data-act="paid" data-id="' +
-        id + '" title="Mark this due as paid"' + off + ">Mark paid</button>"
+        id + '" title="' + (t.status === "paid" ? "Clear this due" : "Mark this due as paid") +
+        '"' + off + ">Mark paid</button>"
       : "") +
     '<button class="btn btn-secondary btn-sm" type="button" data-act="edit" data-id="' +
       id + '" title="Edit sale" aria-label="Edit sale"' + off + ">" + ICON_EDIT + "</button>" +
@@ -736,26 +747,148 @@ async function viewReceipt(row) {
 
 /* ---------------- Settle / delete ---------------- */
 
-async function settleRow(row, closed) {
-  const ok = await confirm({
-    title: "Mark as paid",
-    message:
-      "Mark the " + formatINR(row.totalPaise) + " due for " + row.serviceName + " as paid?",
-    confirmText: "Mark paid",
-    variant: "primary",
+/* Settling asks HOW the due was paid, because the money the shop put in
+   the till arrived by cash, UPI or card — and the day's counters can only
+   move out of the due bucket into one of those three. Flipping the status
+   alone left every view that reads the heads (the calendar, the dashboard,
+   the month summary) still counting the amount as due: the sale was paid,
+   but the money had nowhere to go. */
+function buildSettleOverlay() {
+  const el = document.createElement("div");
+  el.className = "modal-overlay";
+  el.id = "txnSettleModal";
+  el.setAttribute("role", "dialog");
+  el.setAttribute("aria-modal", "true");
+  el.setAttribute("aria-labelledby", "txnSettleTitle");
+  el.innerHTML =
+    '<div class="modal modal-sm" role="document">' +
+    '<div class="modal-header">' +
+    '<div class="modal-header-text">' +
+    '<h3 id="txnSettleTitle">Mark as paid</h3>' +
+    '<p class="modal-header-sub" id="txnSettleSub"></p>' +
+    "</div>" +
+    '<button class="modal-close" type="button" data-close aria-label="Close">' + ICON_CLOSE + "</button>" +
+    "</div>" +
+    '<div class="modal-body">' +
+    '<p class="small muted">This money arrives now — pick how it was paid.</p>' +
+    '<div class="seg-row" id="txnSettleMethodRow" role="group" aria-label="How the customer paid">' +
+    '<button class="seg-btn seg-cash" type="button" data-method="cash">' + ICON_CASH + "Cash</button>" +
+    '<button class="seg-btn seg-upi" type="button" data-method="upi">' + ICON_UPI + "UPI</button>" +
+    '<button class="seg-btn seg-card" type="button" data-method="card">' + ICON_CARD + "Card</button>" +
+    "</div>" +
+    '<p class="small text-danger is-hidden" id="txnSettleError" role="alert"></p>' +
+    "</div>" +
+    '<div class="modal-footer">' +
+    '<button class="btn btn-secondary" type="button" data-close>Cancel</button>' +
+    '<button class="btn btn-primary" type="button" id="txnSettleSave">Mark paid</button>' +
+    "</div>" +
+    "</div>";
+  el.querySelectorAll("#txnSettleMethodRow .seg-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      settleMethod = btn.getAttribute("data-method");
+      el.querySelectorAll("#txnSettleMethodRow .seg-btn").forEach((b) =>
+        b.classList.toggle("is-active", b === btn)
+      );
+    });
   });
-  if (!ok) return false;
+  el.querySelector("#txnSettleSave").addEventListener("click", saveSettle);
+  /* The cancel paths are ours to report: the page is waiting on a verdict. */
+  el.querySelectorAll("[data-close]").forEach((btn) =>
+    btn.addEventListener("click", () => doneSettle(false))
+  );
+  el.addEventListener("click", (event) => {
+    if (event.target === el) doneSettle(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && settleOverlay && settleOverlay.classList.contains("is-open")) {
+      doneSettle(false);
+    }
+  });
+  document.body.appendChild(el);
+  return el;
+}
 
+function doneSettle(verdict) {
+  const resolve = settleResolve;
+  settleResolve = null;
+  settleTarget = null;
+  if (settleOverlay) closeModal(settleOverlay);
+  if (typeof resolve === "function") resolve(verdict);
+}
+
+function paintSettleMethod() {
+  settleOverlay.querySelectorAll("#txnSettleMethodRow .seg-btn").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.getAttribute("data-method") === settleMethod);
+  });
+}
+
+function settleRow(row, closed) {
+  if (closed) {
+    toast(CLOSED_DAY_MSG, "error");
+    return Promise.resolve(false);
+  }
+  if (!settleOverlay) settleOverlay = buildSettleOverlay();
+  settleTarget = row;
+  settleMethod = "cash";
+  settling = false;
+
+  settleOverlay.querySelector("#txnSettleSub").textContent =
+    formatINR(row.totalPaise) + " due · " + row.serviceName;
+  const err = settleOverlay.querySelector("#txnSettleError");
+  err.textContent = "";
+  err.classList.add("is-hidden");
+  paintSettleMethod();
+  const btn = settleOverlay.querySelector("#txnSettleSave");
+  setLoading(btn, false);
+  openModal(settleOverlay);
+  return new Promise((resolve) => {
+    settleResolve = resolve;
+  });
+}
+
+function showSettleError(message) {
+  const box = settleOverlay && settleOverlay.querySelector("#txnSettleError");
+  if (!box) return;
+  box.textContent = message;
+  box.classList.remove("is-hidden");
+}
+
+async function saveSettle() {
+  if (settling || !settleTarget) return;
+  const target = settleTarget;
+  const saveBtn = settleOverlay.querySelector("#txnSettleSave");
+
+  const errBox = settleOverlay.querySelector("#txnSettleError");
+  errBox.textContent = "";
+  errBox.classList.add("is-hidden");
+
+  settling = true;
+  setLoading(saveBtn, true);
   try {
-    await assertDayOpen(row);
-    await markTransactionPaid(row.txnId, row.dateKey);
-    row.status = "paid";
+    /* Re-read the day on the way out: another device can close it
+       while the dialog is open. */
+    await assertDayOpen(target);
+    const result = await markTransactionPaid(target.txnId, target.dateKey, settleMethod);
+
+    applyEdit(target, {
+      quantity: target.quantity,
+      ratePaise: target.ratePaise,
+      totalPaise: target.totalPaise,
+      paymentMethod: result.paymentMethod,
+      status: result.status,
+      customerName: target.customerName,
+    });
+
     toast("Marked as paid.", "success");
+    doneSettle(true);
     return true;
   } catch (err) {
-    console.error("[trustx-ledger] settle:", err, row.dateKey, row.txnId);
-    toast(await describeRefusedWrite(err, closed, row), "error");
+    console.error("[trustx-ledger] settle:", err, target.dateKey, target.txnId);
+    setLoading(saveBtn, false);
+    showSettleError(await describeRefusedWrite(err, false, target));
     return false;
+  } finally {
+    settling = false;
   }
 }
 
